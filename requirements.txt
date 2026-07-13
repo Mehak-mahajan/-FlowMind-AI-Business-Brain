@@ -1,0 +1,11 @@
+streamlit
+pdfplumber
+sentence-transformers
+faiss-cpu
+groq
+python-dotenv
+numpy
+python-docx
+python-pptx
+langdetect
+pandas

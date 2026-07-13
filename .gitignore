@@ -1,0 +1,4 @@
+knowledge_base.pkl
+faiss_index.bin
+.env
+__pycache__/
