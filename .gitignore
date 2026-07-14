@@ -2,3 +2,5 @@ knowledge_base.pkl
 faiss_index.bin
 .env
 __pycache__/
+flowmind.db
+
