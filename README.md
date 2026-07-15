@@ -1,6 +1,6 @@
 🧠 FlowMind — AI Business Brain for Small Businesses
 
-🧠 FlowMind — AI Business Brain for Small Businesses
+
 
 Helping small businesses respond faster, capture more opportunities, and understand their customers—without requiring technical expertise or existing documentation.
 
