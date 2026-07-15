@@ -497,11 +497,17 @@ def load_knowledge_base(business_id):
 # ---- QR CODE (NEW) ----
 # =====================================================
 def generate_qr_code(url):
-    """Customers scan this instead of typing a URL — same habit as UPI QR."""
+    """Customers scan this instead of typing a URL — same habit as UPI QR.
+    Returns raw PNG bytes (not the qrcode library's internal image object) —
+    that internal object is a 1-bit image which some Pillow/Streamlit
+    version combinations fail to render directly."""
     qr = qrcode.QRCode(box_size=8, border=2)
     qr.add_data(url)
     qr.make(fit=True)
-    return qr.make_image(fill_color="black", back_color="white")
+    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 # =====================================================
 # ---- QUICK SETUP (NEW) — no organized PDFs needed ----
@@ -882,11 +888,9 @@ with st.sidebar:
         )
         if public_base_url:
             full_url = public_base_url.rstrip("/") + "/" + widget_path
-            qr_img = generate_qr_code(full_url)
-            st.image(qr_img, caption="Print this on your counter, receipts, or shop window", width=200)
-            buf = io.BytesIO()
-            qr_img.save(buf, format="PNG")
-            st.download_button("📥 Download QR Code", buf.getvalue(), f"{business_id}_qr.png", "image/png")
+            qr_bytes = generate_qr_code(full_url)
+            st.image(qr_bytes, caption="Print this on your counter, receipts, or shop window", width=200)
+            st.download_button("📥 Download QR Code", qr_bytes, f"{business_id}_qr.png", "image/png")
         else:
             st.caption("Customers scan this to open your assistant directly — no typing needed.")
 
