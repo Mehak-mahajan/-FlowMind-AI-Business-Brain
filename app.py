@@ -640,17 +640,17 @@ def process_files(uploaded_files):
 def safe_detect_language(text):
     """
     langdetect is a statistical model — it needs enough text to work
-    reliably. Short or all-caps messages like 'WHEN WILL ARRIVE' don't
-    give it enough signal, and it can confidently guess the wrong
-    language entirely. Default to English unless detection is both
-    long enough to trust and confident enough to trust.
+    reliably. Short phrases like 'is large size available' don't give
+    it enough signal, and it can confidently guess the wrong language
+    entirely. Default to English unless detection is both long enough
+    to trust and confident enough to trust.
     """
     text = text.strip()
-    if len(text) < 15 or len(text.split()) < 3:
+    if len(text) < 25 or len(text.split()) < 5:
         return "en"
     try:
         candidates = detect_langs(text)
-        if candidates and candidates[0].prob >= 0.75:
+        if candidates and candidates[0].prob >= 0.90:
             return candidates[0].lang
         return "en"
     except Exception:
@@ -728,7 +728,9 @@ def response_has_unverified_contact_info(answer_text, context):
         r'https?://[^\s]+',
         r'\b(?:www\.)?[a-zA-Z0-9][a-zA-Z0-9-]*\.(?:com|in|org|net|co|shop|store|info)\b',
         r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+',
-        r'(?<!\d)(?:\+?91[-\s]?)?\d{10}(?!\d)',
+        # Catches grouped/dashed formats too (e.g. "1800-123-4567"), not just
+        # a bare run of 10 digits — the original version missed this format.
+        r'(?<!\d)(?:\+?\d{1,3}[-\s]?)?\d(?:[-\s]?\d){7,}(?!\d)',
     ]
     context_lower = context.lower()
     for pattern in patterns:
