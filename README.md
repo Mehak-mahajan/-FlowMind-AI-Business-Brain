@@ -6,7 +6,7 @@
 ![FAISS](https://img.shields.io/badge/VectorDB-FAISS-orange)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
-🌐 Live Demo: https://your-app.streamlit.app
+🌐 Live Demo: https://flowmind-mehak.streamlit.app/
 
 🎥 Demo Video: Coming Soon
 
