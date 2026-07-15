@@ -105,7 +105,18 @@ def load_model():
     return SentenceTransformer("intfloat/multilingual-e5-small")
 
 embedding_model = load_model()
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+def get_api_key():
+    # Works locally via .env, and on Streamlit Community Cloud via
+    # the Secrets manager (Settings > Secrets in the deployed app).
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        try:
+            key = st.secrets["GROQ_API_KEY"]
+        except Exception:
+            key = None
+    return key
+
+groq_client = Groq(api_key=get_api_key())
 
 # Anchor storage to this script's own folder — not the current working
 # directory, which can silently change depending on how streamlit gets
