@@ -2,10 +2,11 @@ streamlit
 pdfplumber
 sentence-transformers
 faiss-cpu
+numpy
 groq
 python-dotenv
-numpy
 python-docx
 python-pptx
 langdetect
 pandas
+qrcode[pil]

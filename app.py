@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 import os
 import docx
 import pptx
-from langdetect import detect
+from langdetect import detect, detect_langs
 import pandas as pd
 from datetime import datetime
 import pickle
@@ -16,6 +16,8 @@ import sqlite3
 import json
 import hashlib
 import re
+import io
+import qrcode
 
 load_dotenv()
 
@@ -95,20 +97,28 @@ st.markdown("""
 # ---- LOAD MODELS ----
 @st.cache_resource
 def load_model():
-    return SentenceTransformer(
-        "paraphrase-multilingual-MiniLM-L12-v2"
-    )
+    # multilingual-e5-small is built for asymmetric retrieval (short question
+    # vs longer document text) — unlike paraphrase models, it's specifically
+    # trained to match "WHEN WILL ARRIVE" against "Shipping: Pan India"
+    # style content. Needs "query: " / "passage: " prefixes (added below)
+    # to actually get this benefit — that's part of how the model was trained.
+    return SentenceTransformer("intfloat/multilingual-e5-small")
 
 embedding_model = load_model()
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-KB_DIR = "kb_store"
+# Anchor storage to this script's own folder — not the current working
+# directory, which can silently change depending on how streamlit gets
+# launched (double-click, different terminal cwd, etc.) and make it look
+# like accounts/data "disappeared" when really it's reading a different file.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+KB_DIR = os.path.join(BASE_DIR, "kb_store")
 os.makedirs(KB_DIR, exist_ok=True)
 
 # =====================================================
 # ---- SQLITE: MULTI-BUSINESS SCHEMA (NEW) ----
 # =====================================================
-DB_PATH = "flowmind.db"
+DB_PATH = os.path.join(BASE_DIR, "flowmind.db")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -150,11 +160,29 @@ def init_db():
             time TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            business_id TEXT,
+            name TEXT,
+            price TEXT,
+            description TEXT,
+            created_at TEXT
+        )
+    """)
     conn.commit()
 
     # Migration: add follow_up_sent to leads if this is an older DB file
     try:
         c.execute("ALTER TABLE leads ADD COLUMN follow_up_sent INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    # Migration: private_notes on businesses — visible only to the owner,
+    # never fed to the AI or shown to customers
+    try:
+        c.execute("ALTER TABLE businesses ADD COLUMN private_notes TEXT DEFAULT ''")
         conn.commit()
     except sqlite3.OperationalError:
         pass  # column already exists
@@ -170,6 +198,12 @@ def slugify(name):
 
 def hash_pw(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
+
+def normalize_business_id(business_id):
+    # Business IDs are always generated lowercase — if someone types it back
+    # with different casing or stray spaces (easy to do, it's not a password
+    # they're used to typing carefully), lookups should still succeed.
+    return (business_id or "").strip().lower()
 
 def create_business(name, password):
     conn = sqlite3.connect(DB_PATH)
@@ -192,6 +226,7 @@ def create_business(name, password):
     return business_id
 
 def verify_business(business_id, password):
+    business_id = normalize_business_id(business_id)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     row = c.execute(
@@ -203,6 +238,7 @@ def verify_business(business_id, password):
     return False
 
 def get_business_name(business_id):
+    business_id = normalize_business_id(business_id)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     row = c.execute(
@@ -212,6 +248,7 @@ def get_business_name(business_id):
     return row[0] if row else business_id
 
 def business_exists(business_id):
+    business_id = normalize_business_id(business_id)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     row = c.execute(
@@ -375,6 +412,52 @@ def count_rows(table, business_id):
     return n
 
 # =====================================================
+# ---- PRIVATE NOTES (NEW) — owner-only, never fed to the AI ----
+# =====================================================
+def save_private_notes(business_id, notes):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE businesses SET private_notes=? WHERE business_id=?", (notes, business_id))
+    conn.commit()
+    conn.close()
+
+def get_private_notes(business_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    row = c.execute("SELECT private_notes FROM businesses WHERE business_id=?", (business_id,)).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else ""
+
+# =====================================================
+# ---- PRODUCTS (NEW) — a browsable list customers see directly,
+# not just something they have to ask the chatbot about ----
+# =====================================================
+def add_product(business_id, name, price, description):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO products (business_id, name, price, description, created_at) VALUES (?, ?, ?, ?, ?)",
+        (business_id, name, price, description, datetime.now().strftime("%Y-%m-%d %H:%M"))
+    )
+    conn.commit()
+    conn.close()
+
+def get_products(business_id):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT * FROM products WHERE business_id=? ORDER BY id DESC", conn, params=(business_id,)
+    )
+    conn.close()
+    return df
+
+def delete_product(product_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM products WHERE id=?", (product_id,))
+    conn.commit()
+    conn.close()
+
+# =====================================================
 # ---- PER-BUSINESS KNOWLEDGE BASE (NEW) ----
 # =====================================================
 def kb_paths(business_id):
@@ -398,6 +481,83 @@ def load_knowledge_base(business_id):
         index = faiss.read_index(idx_path)
         return data["chunks"], data["metadata"], index
     return None, None, None
+
+# =====================================================
+# ---- QR CODE (NEW) ----
+# =====================================================
+def generate_qr_code(url):
+    """Customers scan this instead of typing a URL — same habit as UPI QR."""
+    qr = qrcode.QRCode(box_size=8, border=2)
+    qr.add_data(url)
+    qr.make(fit=True)
+    return qr.make_image(fill_color="black", back_color="white")
+
+# =====================================================
+# ---- QUICK SETUP (NEW) — no organized PDFs needed ----
+# =====================================================
+def build_business_profile_text(answers):
+    lines = []
+    for label, value in answers.items():
+        if value and value.strip():
+            lines.append(f"{label}: {value.strip()}")
+    return "\n\n".join(lines)
+
+def _normalize_vectors(vectors):
+    vectors = np.array(vectors)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / np.clip(norms, 1e-10, None)
+
+def append_to_kb(business_id, new_chunks, new_metadata, new_vectors):
+    """Adds to the existing knowledge base instead of replacing it —
+    lets Quick Setup and file uploads build on each other over time."""
+    existing_chunks, existing_metadata, existing_index = load_knowledge_base(business_id)
+    if existing_chunks is None:
+        dimension = new_vectors.shape[1]
+        index = faiss.IndexFlatL2(dimension)
+        index.add(new_vectors)
+        save_knowledge_base(business_id, new_chunks, new_metadata, index)
+    else:
+        existing_index.add(new_vectors)
+        save_knowledge_base(
+            business_id,
+            existing_chunks + new_chunks,
+            existing_metadata + new_metadata,
+            existing_index
+        )
+
+def process_quick_setup(business_id, answers):
+    """Turns a simple Q&A form into knowledge base chunks — for business
+    owners who don't have organized PDFs, which is most small businesses."""
+    text_blob = build_business_profile_text(answers)
+    if not text_blob.strip():
+        return False
+
+    chunk_size, overlap = 500, 100
+    step = chunk_size - overlap
+    chunks, metadata = [], []
+    for i in range(0, len(text_blob), step):
+        chunk = text_blob[i:i + chunk_size]
+        if chunk.strip():
+            chunks.append(chunk)
+            metadata.append({"file": "Quick Setup Info", "page": 1})
+
+    if not chunks:
+        return False
+
+    # e5 models need "passage: " prefix on document-side text to work correctly
+    prefixed_chunks = [f"passage: {c}" for c in chunks]
+    vectors = embedding_model.encode(prefixed_chunks, show_progress_bar=False, batch_size=16)
+    vectors = _normalize_vectors(vectors)
+    append_to_kb(business_id, chunks, metadata, vectors)
+    return True
+
+def embed_product_in_kb(business_id, name, price, description):
+    """So the chatbot can also answer questions about a product,
+    not just show it in the browsable list."""
+    text = f"Product: {name} | Price: {price} | Details: {description}"
+    vectors = embedding_model.encode([f"passage: {text}"], show_progress_bar=False)
+    vectors = _normalize_vectors(vectors)
+    append_to_kb(business_id, [text], [{"file": "Product Catalog", "page": 1}], vectors)
 
 # ---- TEXT EXTRACTION ----
 def extract_text(uploaded_file):
@@ -459,11 +619,31 @@ def process_files(uploaded_files):
     if not all_chunks:
         return None, None, None
 
-    vectors = embedding_model.encode(all_chunks, show_progress_bar=False, batch_size=32)
-    dimension = len(vectors[0])
-    index = faiss.IndexFlatL2(dimension)
-    index.add(np.array(vectors))
-    return all_chunks, all_metadata, index
+    # e5 models need "passage: " prefix on document-side text to work correctly
+    prefixed_chunks = [f"passage: {c}" for c in all_chunks]
+    vectors = embedding_model.encode(prefixed_chunks, show_progress_bar=False, batch_size=32)
+    vectors = _normalize_vectors(vectors)
+    return all_chunks, all_metadata, vectors
+
+# ---- LANGUAGE DETECTION (confidence-gated) ----
+def safe_detect_language(text):
+    """
+    langdetect is a statistical model — it needs enough text to work
+    reliably. Short or all-caps messages like 'WHEN WILL ARRIVE' don't
+    give it enough signal, and it can confidently guess the wrong
+    language entirely. Default to English unless detection is both
+    long enough to trust and confident enough to trust.
+    """
+    text = text.strip()
+    if len(text) < 15 or len(text.split()) < 3:
+        return "en"
+    try:
+        candidates = detect_langs(text)
+        if candidates and candidates[0].prob >= 0.75:
+            return candidates[0].lang
+        return "en"
+    except Exception:
+        return "en"
 
 # ---- LLM-BASED CLASSIFICATION ----
 def classify_message(text):
@@ -502,8 +682,13 @@ def retrieve_context(question, chunks, metadata, index, confidence_threshold):
     is_confident=False means the best match is too weak to trust —
     caller should fall back instead of asking the LLM to guess.
     """
-    question_vector = embedding_model.encode([question])
-    distances, indices = index.search(np.array(question_vector), 3)
+    # e5 models need "query: " prefix on question-side text to work correctly
+    question_vector = embedding_model.encode([f"query: {question}"])
+    question_vector = np.array(question_vector)
+    question_vector = question_vector / np.clip(
+        np.linalg.norm(question_vector, axis=1, keepdims=True), 1e-10, None
+    )
+    distances, indices = index.search(question_vector, 3)
 
     best_distance = float(distances[0][0])
     is_confident = best_distance <= confidence_threshold
@@ -518,6 +703,30 @@ def retrieve_context(question, chunks, metadata, index, confidence_threshold):
 
     return context, sources, is_confident, best_distance
 
+# =====================================================
+# ---- HALLUCINATION GUARD (NEW) ----
+# =====================================================
+def response_has_unverified_contact_info(answer_text, context):
+    """
+    LLMs can invent specific-sounding details (a support URL, an email,
+    a phone number) even when told to use only the given context — this
+    catches that before it reaches the customer. A fabricated contact
+    detail is worse than an honest 'let me connect you with support'.
+    """
+    patterns = [
+        r'https?://[^\s]+',
+        r'\b(?:www\.)?[a-zA-Z0-9][a-zA-Z0-9-]*\.(?:com|in|org|net|co|shop|store|info)\b',
+        r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+',
+        r'(?<!\d)(?:\+?91[-\s]?)?\d{10}(?!\d)',
+    ]
+    context_lower = context.lower()
+    for pattern in patterns:
+        for match in re.findall(pattern, answer_text, flags=re.IGNORECASE):
+            cleaned = match.lower().strip(".,;:")
+            if cleaned and cleaned not in context_lower:
+                return True
+    return False
+
 # ---- ASK QUESTION (with memory + confidence fallback) ----
 def ask_question(question, context, lang, history):
     messages = [
@@ -525,13 +734,18 @@ def ask_question(question, context, lang, history):
             "role": "system",
             "content": f"""You are FlowMind, an intelligent AI business assistant for an e-commerce store.
             Answer in same language as question (detected: {lang}).
-            Use ONLY the provided context.
+            Use ONLY the provided context — never state a website, email, phone number,
+            or any specific detail unless it is written word-for-word in the context.
+            If contact details aren't in the context, say you'll connect them with support
+            instead of guessing or inventing one.
             Use the recent conversation for follow-up questions (e.g. 'what about the blue one').
             Be helpful, friendly and concise."""
         }
     ]
     for turn in history[-6:]:
-        messages.append(turn)
+        # session_state messages carry extra fields (like "sources") for the UI —
+        # Groq's API only accepts role/content, so strip anything else here.
+        messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"})
 
     stream = groq_client.chat.completions.create(
@@ -578,7 +792,7 @@ def generate_faqs(chunks):
 # ---- SESSION STATE ----
 for key, default in [
     ("messages", []), ("questions_count", 0), ("is_admin", False),
-    ("business_id", None), ("confidence_threshold", 1.3)
+    ("business_id", None), ("confidence_threshold", 0.75)
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -621,7 +835,7 @@ with st.sidebar:
             if st.button("Login"):
                 if verify_business(login_id, login_pw):
                     st.session_state.is_admin = True
-                    st.session_state.business_id = login_id
+                    st.session_state.business_id = normalize_business_id(login_id)
                     st.rerun()
                 else:
                     st.error("❌ Wrong business ID or password!")
@@ -643,24 +857,122 @@ with st.sidebar:
         business_id = st.session_state.business_id
         st.success(f"✅ Logged in as: {get_business_name(business_id)}")
 
-        widget_url = f"?biz={business_id}"
-        st.text_input("🔗 Shareable customer widget link", value=widget_url)
-        st.caption("Share this link — customers use it, no password needed.")
+        widget_path = f"?biz={business_id}"
+        st.text_input("🔗 Shareable customer widget link (path)", value=widget_path)
+
+        # NEW: QR code — customers scan instead of typing a URL. Familiar
+        # behavior in India already (UPI QR codes), so no new habit to teach.
+        st.caption("Enter your app's published URL once you deploy it, to get a scannable QR code:")
+        public_base_url = st.text_input(
+            "Your published app URL", placeholder="https://your-app.streamlit.app",
+            key="public_base_url"
+        )
+        if public_base_url:
+            full_url = public_base_url.rstrip("/") + "/" + widget_path
+            qr_img = generate_qr_code(full_url)
+            st.image(qr_img, caption="Print this on your counter, receipts, or shop window", width=200)
+            buf = io.BytesIO()
+            qr_img.save(buf, format="PNG")
+            st.download_button("📥 Download QR Code", buf.getvalue(), f"{business_id}_qr.png", "image/png")
+        else:
+            st.caption("Customers scan this to open your assistant directly — no typing needed.")
 
         st.divider()
-        st.markdown("### 📁 Upload Documents")
-        uploaded_files = st.file_uploader(
-            "Upload catalogs, policies, FAQs",
-            type=["pdf", "txt", "docx", "pptx", "csv"],
-            accept_multiple_files=True
-        )
-        if uploaded_files:
-            if st.button("🧠 Process & Save Documents"):
-                with st.spinner("Processing..."):
-                    new_chunks, new_metadata, new_index = process_files(uploaded_files)
-                    if new_chunks:
-                        save_knowledge_base(business_id, new_chunks, new_metadata, new_index)
+        st.markdown("### 📁 Build Your Knowledge Base")
+        tab_quick, tab_upload = st.tabs(["✍️ Quick Setup (no files needed)", "📁 Upload Documents"])
+
+        with tab_quick:
+            st.caption("Don't have organized PDFs? Just answer these — takes 2 minutes.")
+            with st.form("quick_setup_form"):
+                q_products = st.text_area("What do you sell? (products/services, briefly)")
+                q_pricing = st.text_area("Pricing info (ranges are fine)")
+                q_shipping = st.text_area("Shipping / delivery details")
+                q_returns = st.text_area("Return / refund policy")
+                q_hours = st.text_input("Business hours")
+                q_contact = st.text_input("Contact info (phone/email/address)")
+                q_faqs = st.text_area("Anything else customers often ask?")
+                quick_submit = st.form_submit_button("➕ Add to Knowledge Base")
+
+                if quick_submit:
+                    answers = {
+                        "Products/Services": q_products, "Pricing": q_pricing,
+                        "Shipping": q_shipping, "Returns/Refunds": q_returns,
+                        "Business Hours": q_hours, "Contact": q_contact, "Other FAQs": q_faqs
+                    }
+                    with st.spinner("Adding to knowledge base..."):
+                        added = process_quick_setup(business_id, answers)
+                    if added:
+                        st.success("✅ Added! Your assistant can now answer from this.")
                         st.rerun()
+                    else:
+                        st.warning("Please fill in at least one field.")
+
+        with tab_upload:
+            uploaded_files = st.file_uploader(
+                "Upload catalogs, policies, FAQs",
+                type=["pdf", "txt", "docx", "pptx", "csv"],
+                accept_multiple_files=True
+            )
+            st.caption("Adds to your existing knowledge base — works alongside Quick Setup, nothing gets overwritten.")
+            if uploaded_files:
+                if st.button("🧠 Process & Save Documents"):
+                    with st.spinner("Processing..."):
+                        new_chunks, new_metadata, new_vectors = process_files(uploaded_files)
+                        if new_chunks:
+                            append_to_kb(business_id, new_chunks, new_metadata, new_vectors)
+                            st.rerun()
+
+        st.divider()
+
+        # NEW: Product Catalog — customers see this directly, not just through chat
+        st.markdown("### 📦 Product Catalog")
+        st.caption("Shown directly to customers above the chat — no need to ask the bot to discover what you sell.")
+        with st.form("add_product_form"):
+            p_name = st.text_input("Product name")
+            p_price = st.text_input("Price (e.g. ₹1,200 or ₹500-₹2,000)")
+            p_desc = st.text_area("Short description", height=68)
+            add_product_submit = st.form_submit_button("➕ Add Product")
+            if add_product_submit and p_name:
+                add_product(business_id, p_name, p_price, p_desc)
+                embed_product_in_kb(business_id, p_name, p_price, p_desc)
+                st.success(f"✅ Added {p_name} — visible to customers and searchable by chat.")
+                st.rerun()
+
+        products_df = get_products(business_id)
+        if not products_df.empty:
+            for _, prod in products_df.iterrows():
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    st.caption(f"**{prod['name']}** — {prod['price']}")
+                with col2:
+                    if st.button("🗑️", key=f"delprod_{prod['id']}"):
+                        delete_product(prod["id"])
+                        st.rerun()
+
+        st.divider()
+
+        # NEW: Private Notes — only the owner ever sees this, never fed to the AI
+        st.markdown("### 🔒 Private Notes")
+        st.caption("Only you can see this. Never shown to customers, never used by the AI. "
+                   "Use it for internal info like supplier contacts, cost prices, or reminders.")
+        current_notes = get_private_notes(business_id)
+        new_notes = st.text_area("Your private notes", value=current_notes, height=100, key="private_notes_box")
+        if st.button("💾 Save Private Notes"):
+            save_private_notes(business_id, new_notes)
+            st.success("Saved — visible only to you.")
+
+        st.divider()
+
+        with st.expander("⚠️ Danger Zone"):
+            st.caption("Quick Setup and Document Upload both add to your knowledge base. "
+                       "Use this only if you want to wipe everything and start over.")
+            if st.button("🗑️ Reset Knowledge Base Completely"):
+                pkl_path, idx_path = kb_paths(business_id)
+                for p in (pkl_path, idx_path):
+                    if os.path.exists(p):
+                        os.remove(p)
+                st.success("Knowledge base cleared. Add new info via Quick Setup or Upload.")
+                st.rerun()
 
         st.divider()
 
@@ -668,9 +980,12 @@ with st.sidebar:
         st.markdown("### 🎯 Answer Confidence")
         st.session_state.confidence_threshold = st.slider(
             "Lower = stricter (fewer guesses, more handoffs to support)",
-            min_value=0.5, max_value=2.5,
-            value=st.session_state.confidence_threshold, step=0.1
+            min_value=0.3, max_value=1.8,
+            value=st.session_state.confidence_threshold, step=0.05
         )
+        if "last_match_distance" in st.session_state:
+            st.caption(f"Last question's match distance: {st.session_state.last_match_distance:.2f} "
+                       f"({'✅ confident' if st.session_state.last_match_distance <= st.session_state.confidence_threshold else '⚠️ fell back'})")
 
         st.divider()
         st.markdown("### 📊 Analytics")
@@ -773,6 +1088,17 @@ if active_business_id and chunks:
     </div>
     """, unsafe_allow_html=True)
 
+    # NEW: browsable product list — customers see this without having
+    # to ask the chatbot to discover what's available
+    customer_products = get_products(active_business_id)
+    if not customer_products.empty:
+        with st.expander(f"📦 Browse {get_business_name(active_business_id)}'s Products", expanded=False):
+            for _, prod in customer_products.iterrows():
+                st.markdown(f"**{prod['name']}** — {prod['price']}")
+                if prod['description']:
+                    st.caption(prod['description'])
+                st.divider()
+
     for message in st.session_state.messages:
         if message["role"] == "user":
             st.markdown(f'<div class="user-bubble">👤 {message["content"]}</div>', unsafe_allow_html=True)
@@ -818,14 +1144,12 @@ if active_business_id and chunks:
                     save_lead_db(active_business_id, lead)
                     st.success(f"✅ Lead saved! Total: {count_rows('leads', active_business_id)}")
 
-        try:
-            lang = detect(question)
-        except Exception:
-            lang = "en"
+        lang = safe_detect_language(question)
 
         context, sources, is_confident, best_distance = retrieve_context(
             question, chunks, metadata, index, st.session_state.confidence_threshold
         )
+        st.session_state.last_match_distance = best_distance
 
         answer_text = ""
         placeholder = st.empty()
@@ -841,8 +1165,17 @@ if active_business_id and chunks:
                 answer_text += content
                 placeholder.markdown(f'<div class="assistant-bubble">🧠 {answer_text}</div>', unsafe_allow_html=True)
 
-            for source in sources:
-                st.markdown(f'<div class="source-tag">📄 {source["file"]} | Page {source["page"]}</div>', unsafe_allow_html=True)
+            # NEW: catch invented contact details (fake URLs/emails/phone numbers)
+            # after the full answer is in — a wrong website is worse than "let me check"
+            if response_has_unverified_contact_info(answer_text, context):
+                answer_text = ("I want to make sure I give you the correct contact details — "
+                                "let me connect you with our support team directly for this. 🙏")
+                placeholder.markdown(f'<div class="assistant-bubble">🧠 {answer_text}</div>', unsafe_allow_html=True)
+                save_gap_db(active_business_id, question)
+                sources = []
+            else:
+                for source in sources:
+                    st.markdown(f'<div class="source-tag">📄 {source["file"]} | Page {source["page"]}</div>', unsafe_allow_html=True)
 
         st.session_state.messages.append({"role": "assistant", "content": answer_text, "sources": sources})
 
