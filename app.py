@@ -181,6 +181,16 @@ def init_db():
             created_at TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS offers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            business_id TEXT,
+            title TEXT,
+            description TEXT,
+            active INTEGER DEFAULT 1,
+            created_at TEXT
+        )
+    """)
     conn.commit()
 
     # Migration: add follow_up_sent to leads if this is an older DB file
@@ -465,6 +475,51 @@ def delete_product(product_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM products WHERE id=?", (product_id,))
+    conn.commit()
+    conn.close()
+
+# =====================================================
+# ---- OFFERS (NEW) — shown the moment a customer opens the widget link.
+# Not a push notification (that needs WhatsApp/SMS APIs, out of scope
+# for now) — this is the "pull" version: grabs attention on arrival.
+# =====================================================
+def add_offer(business_id, title, description):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO offers (business_id, title, description, active, created_at) VALUES (?, ?, ?, 1, ?)",
+        (business_id, title, description, datetime.now().strftime("%Y-%m-%d %H:%M"))
+    )
+    conn.commit()
+    conn.close()
+
+def get_active_offers(business_id):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT * FROM offers WHERE business_id=? AND active=1 ORDER BY id DESC", conn, params=(business_id,)
+    )
+    conn.close()
+    return df
+
+def get_all_offers(business_id):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT * FROM offers WHERE business_id=? ORDER BY id DESC", conn, params=(business_id,)
+    )
+    conn.close()
+    return df
+
+def toggle_offer(offer_id, active):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE offers SET active=? WHERE id=?", (1 if active else 0, offer_id))
+    conn.commit()
+    conn.close()
+
+def delete_offer(offer_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM offers WHERE id=?", (offer_id,))
     conn.commit()
     conn.close()
 
@@ -968,6 +1023,39 @@ with st.sidebar:
 
         st.divider()
 
+        # NEW: Offers — shown to customers the moment they open the widget link.
+        # Not a daily push message (needs WhatsApp/SMS integration, not yet
+        # built) — this is the "pull" version: grabs attention on arrival.
+        st.markdown("### 🎉 Offers & Promotions")
+        st.caption("Shown as a banner the moment a customer opens your chat link.")
+        with st.form("add_offer_form"):
+            o_title = st.text_input("Offer title", placeholder="e.g. Flat 20% off this week!")
+            o_desc = st.text_area("Details (optional)", height=60)
+            add_offer_submit = st.form_submit_button("➕ Add Offer")
+            if add_offer_submit and o_title:
+                add_offer(business_id, o_title, o_desc)
+                st.success("✅ Offer added — customers will see it now.")
+                st.rerun()
+
+        all_offers_df = get_all_offers(business_id)
+        if not all_offers_df.empty:
+            for _, offer in all_offers_df.iterrows():
+                col1, col2, col3 = st.columns([4, 1, 1])
+                with col1:
+                    status = "🟢 Live" if offer["active"] else "⚪ Off"
+                    st.caption(f"{status} — **{offer['title']}**")
+                with col2:
+                    label = "Turn off" if offer["active"] else "Turn on"
+                    if st.button(label, key=f"toggle_offer_{offer['id']}"):
+                        toggle_offer(offer["id"], not offer["active"])
+                        st.rerun()
+                with col3:
+                    if st.button("🗑️", key=f"del_offer_{offer['id']}"):
+                        delete_offer(offer["id"])
+                        st.rerun()
+
+        st.divider()
+
         # NEW: Private Notes — only the owner ever sees this, never fed to the AI
         st.markdown("### 🔒 Private Notes")
         st.caption("Only you can see this. Never shown to customers, never used by the AI. "
@@ -1104,6 +1192,17 @@ if active_business_id and chunks:
         <p style="color:#25D366;margin:0;font-size:12px;">● Online | Ask us anything!</p>
     </div>
     """, unsafe_allow_html=True)
+
+    # NEW: offer banner — the closest thing to "hey, check this out" a
+    # customer sees the moment they open the link, without needing a
+    # real push-notification channel
+    active_offers = get_active_offers(active_business_id)
+    for _, offer in active_offers.iterrows():
+        offer_html = f'<div class="lead-box">🎉 <strong>{offer["title"]}</strong>'
+        if offer["description"]:
+            offer_html += f'<br><span style="font-size:13px;">{offer["description"]}</span>'
+        offer_html += '</div>'
+        st.markdown(offer_html, unsafe_allow_html=True)
 
     # NEW: browsable product list — customers see this without having
     # to ask the chatbot to discover what's available
