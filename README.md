@@ -8,7 +8,7 @@
 
 🌐 Live Demo: https://flowmind-mehak.streamlit.app/
 
-🎥 Demo Video: Coming Soon
+🎥 Demo Video: https://drive.google.com/file/d/1pwB-zdqVU7NUj9OgPV1C59QNx48EEFG_/view?usp=drivesdk
 
 Helping small businesses respond instantly, capture every opportunity, and continuously improve customer support—without requiring technical expertise or existing documentation.
 
